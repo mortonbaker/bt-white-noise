@@ -30,16 +30,19 @@ streams_lock = threading.Lock()
 
 
 def make_ffmpeg(audio_file: str) -> subprocess.Popen:
+    # Output 22.05 kHz mono s16le — 4x less WiFi traffic to the ESP32 than
+    # 44.1 kHz stereo. ESP32 upsamples in firmware (nearest-neighbor, which
+    # is fine for noise / rain content).
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
-        "-re",                          # pace at real-time so we don't buffer hours ahead
-        "-stream_loop", "-1",           # loop forever
+        "-re",
+        "-stream_loop", "-1",
         "-i", audio_file,
         "-f", "s16le",
-        "-ar", "44100",
-        "-ac", "2",
-        "-",                             # output to stdout
+        "-ar", "22050",
+        "-ac", "1",
+        "-",
     ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -80,10 +83,10 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({
             "file": AUDIO_FILE,
             "size_bytes": sz,
-            "sample_rate": 44100,
-            "channels": 2,
+            "sample_rate": 22050,
+            "channels": 1,
             "bits": 16,
-            "bytes_per_sec": 44100 * 2 * 2,
+            "bytes_per_sec": 22050 * 1 * 2,
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -101,7 +104,7 @@ class Handler(BaseHTTPRequestHandler):
             active_streams.add(proc)
         try:
             self.send_response(200)
-            self.send_header("Content-Type", "audio/L16; rate=44100; channels=2")
+            self.send_header("Content-Type", "audio/L16; rate=22050; channels=1")
             self.send_header("Cache-Control", "no-cache, no-store")
             # No Content-Length — streaming forever
             self.end_headers()

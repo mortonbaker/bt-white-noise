@@ -128,33 +128,62 @@ static int customVprintf(const char* fmt, va_list args) {
 }
 
 // --- noise generators --------------------------------------------------------
+//
+// White: uniform random ±full-scale.
+// Pink:  Paul Kellet's IIR filter cascade — sounds far more "real" than Voss-
+//        McCartney. Constants from www.firstpr.com.au/dsp/pink-noise/ .
+// Brown: single-pole IIR low-pass on white noise, properly tuned. The leak
+//        factor (0.997) sets the corner around 50 Hz at 44.1 kHz which gives
+//        a real rumble that even a tiny Bose driver can reproduce some of.
+//
+// All return int16_t in range ±32767. ESP32 has a single-precision FPU so
+// float math here is cheap.
+
+static inline float whiteFloat() {
+  // 32-bit random -> float in [-1.0, 1.0)
+  uint32_t r = esp_random();
+  int32_t s = (int32_t)r;
+  return (float)s / 2147483648.0f;
+}
+
 static inline int16_t whiteSample() {
-  return (int16_t)(esp_random() & 0xFFFF) - 0x8000;
+  return (int16_t)((int32_t)(esp_random() & 0xFFFF) - 0x8000);
 }
+
 static inline int16_t pinkSample() {
-  static int32_t rows[7] = {0};
-  static int32_t total = 0;
-  static uint32_t counter = 0;
-  counter++;
-  int idx = __builtin_ctz(counter);
-  if (idx < 7) {
-    total -= rows[idx];
-    rows[idx] = (int32_t)(whiteSample() / 8);
-    total += rows[idx];
-  }
-  int32_t v = total;
-  if (v > 32767) v = 32767;
-  if (v < -32768) v = -32768;
-  return (int16_t)v;
+  static float b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+  float w = whiteFloat();
+  b0 = 0.99886f * b0 + w * 0.0555179f;
+  b1 = 0.99332f * b1 + w * 0.0750759f;
+  b2 = 0.96900f * b2 + w * 0.1538520f;
+  b3 = 0.86650f * b3 + w * 0.3104856f;
+  b4 = 0.55000f * b4 + w * 0.5329522f;
+  b5 = -0.7616f * b5 - w * 0.0168980f;
+  float pink = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362f;
+  b6 = w * 0.115926f;
+  // Kellet sum is roughly ±3-4 at unity input; scale to ~0.5 of full-scale
+  pink *= 0.11f;
+  if (pink > 1.0f) pink = 1.0f;
+  if (pink < -1.0f) pink = -1.0f;
+  return (int16_t)(pink * 32767.0f);
 }
+
 static inline int16_t brownSample() {
-  // Less aggressive damping than v3 so the output doesn't drift to silence
-  static int32_t state = 0;
-  state += (int32_t)((int16_t)(esp_random() & 0xFFFF) - 0x8000) / 16;
-  state -= state / 4096;
-  if (state > 32767) state = 32767;
-  if (state < -32768) state = -32768;
-  return (int16_t)state;
+  // One-pole low-pass: y[n] = a*y[n-1] + (1-a)*x[n]
+  // a = 0.997 gives ~21 Hz corner at 44.1 kHz; combined with the scale,
+  // produces a satisfying rumble without DC drift.
+  static float y = 0;
+  float w = whiteFloat();
+  y = 0.997f * y + 0.05f * w;
+  // Light hard limit (shouldn't normally hit)
+  if (y > 1.0f)  y =  1.0f;
+  if (y < -1.0f) y = -1.0f;
+  // Brown noise is naturally low-amplitude after filtering — boost so it's
+  // actually audible through the speaker.
+  float out = y * 6.0f;
+  if (out > 1.0f)  out =  1.0f;
+  if (out < -1.0f) out = -1.0f;
+  return (int16_t)(out * 32767.0f);
 }
 
 // --- A2DP data callback ------------------------------------------------------
@@ -246,21 +275,36 @@ void streamTask(void* arg) {
     logLine("[stream] HTTP connected, streaming PCM");
     unsigned long lastLog = millis();
     uint32_t streamBytes = 0;
+    // Upsample buffer: each 16-bit mono input sample becomes 8 bytes of
+    // stereo 44.1 kHz output (2 stereo frames, both channels = sample).
+    uint8_t outbuf[1024 * 4];
     while (client.connected() && streamTaskShouldRun
            && currentSource == SRC_STREAM && streaming) {
-      // Yield FIRST so HTTP server / other tasks get CPU even when WiFi data
-      // is constantly available (which it is, at fixed PCM rate).
+      // Yield first so HTTP server / other tasks get CPU.
       vTaskDelay(pdMS_TO_TICKS(5));
 
       int avail = client.available();
       if (avail > 0) {
-        int rd = client.read(scratch, min((int)sizeof(scratch), avail));
-        if (rd > 0) {
+        // Read mono 22.05 kHz s16le samples; cap to 1024 bytes (512 samples).
+        int rd = client.read(scratch, min(1024, avail));
+        if (rd > 0 && (rd & 1) == 0) {  // need an even byte count
+          int n_samples = rd / 2;
+          const int16_t* in_s = (const int16_t*)scratch;
+          int16_t* out_s = (int16_t*)outbuf;
+          // Each input mono sample -> 4 output int16s (L, R, L, R) at 44.1 kHz
+          for (int i = 0; i < n_samples; i++) {
+            int16_t s = in_s[i];
+            out_s[i * 4 + 0] = s;
+            out_s[i * 4 + 1] = s;
+            out_s[i * 4 + 2] = s;
+            out_s[i * 4 + 3] = s;
+          }
+          size_t outBytes = (size_t)n_samples * 8;
           size_t written = 0;
-          while (written < (size_t)rd) {
-            size_t w = pcmWrite(scratch + written, rd - written);
+          while (written < outBytes) {
+            size_t w = pcmWrite(outbuf + written, outBytes - written);
             written += w;
-            if (written < (size_t)rd) vTaskDelay(pdMS_TO_TICKS(10));
+            if (written < outBytes) vTaskDelay(pdMS_TO_TICKS(10));
           }
           streamBytes += rd;
         }
@@ -536,7 +580,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
 
-  logLine("=== bt-white-noise v4.5 boot ===");
+  logLine("=== bt-white-noise v4.6 boot ===");
   logLine("free heap at start: %u", (unsigned)ESP.getFreeHeap());
 
   WiFi.mode(WIFI_STA);
