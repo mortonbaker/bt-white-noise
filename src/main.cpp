@@ -17,6 +17,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_log.h>
+#include <esp_gap_bt_api.h>
 #include "BluetoothA2DPSource.h"
 #include "secrets.h"
 
@@ -247,11 +248,14 @@ void streamTask(void* arg) {
     uint32_t streamBytes = 0;
     while (client.connected() && streamTaskShouldRun
            && currentSource == SRC_STREAM && streaming) {
+      // Yield FIRST so HTTP server / other tasks get CPU even when WiFi data
+      // is constantly available (which it is, at fixed PCM rate).
+      vTaskDelay(pdMS_TO_TICKS(5));
+
       int avail = client.available();
       if (avail > 0) {
         int rd = client.read(scratch, min((int)sizeof(scratch), avail));
         if (rd > 0) {
-          // Wait for space if ring is full; PCM rate is fixed so we just back off
           size_t written = 0;
           while (written < (size_t)rd) {
             size_t w = pcmWrite(scratch + written, rd - written);
@@ -260,8 +264,6 @@ void streamTask(void* arg) {
           }
           streamBytes += rd;
         }
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(2));
       }
       if (millis() - lastLog > 30000) {
         logLine("[stream] %u bytes streamed, ring used %u/%u, underruns=%u",
@@ -520,8 +522,9 @@ void handleVolume() {
 
 void ensureStreamTask() {
   if (streamTaskStarted) return;
-  // Ring buffer is static (BSS) — no allocation needed.
-  BaseType_t ok = xTaskCreatePinnedToCore(streamTask, "stream", 4096, NULL, 1, &streamTaskHandle, 1);
+  // Pin to core 0 (PROTOCOL CPU). Arduino loop() and the HTTP server run on core 1.
+  // Keeping them on separate cores so the HTTP UI stays responsive while audio streams.
+  BaseType_t ok = xTaskCreatePinnedToCore(streamTask, "stream", 4096, NULL, 1, &streamTaskHandle, 0);
   if (ok != pdPASS) {
     logLine("[!] stream task spawn failed (heap free=%u)", (unsigned)ESP.getFreeHeap());
     return;
@@ -533,7 +536,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
 
-  logLine("=== bt-white-noise v4.2 boot ===");
+  logLine("=== bt-white-noise v4.5 boot ===");
   logLine("free heap at start: %u", (unsigned)ESP.getFreeHeap());
 
   WiFi.mode(WIFI_STA);
@@ -574,6 +577,17 @@ void setup() {
   logLine("Starting A2DP scan (name match: 'Bose' or 'SoundLink')");
   a2dp.start();
   logLine("free heap after a2dp.start: %u", (unsigned)ESP.getFreeHeap());
+
+  // Lower BT classic TX power some — the Bose is in the same room
+  // (RSSI ~-25 dBm). Default is +4 dBm; -6 to +3 dBm range frees radio time
+  // for WiFi without breaking BT handshake (N12 was too low to stay connected).
+  esp_bredr_tx_power_set(ESP_PWR_LVL_N6, ESP_PWR_LVL_P3);
+  logLine("BT TX power set to N6..P3 (~-6 to +3 dBm)");
+
+  // Quiet ESP-IDF logs once we're running — they were flooding the serial
+  // and the ring buffer (and the inquiry-scan [match] lines from libraries
+  // chew CPU).
+  esp_log_level_set("*", ESP_LOG_WARN);
   logLine("Visit http://%s for control. POST /source/stream to enable HTTP streaming.",
           WiFi.localIP().toString().c_str());
 }
