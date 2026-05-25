@@ -1,0 +1,14 @@
+[Unit]
+Description=Pull /log from bt-white-noise ESP32 to atlas01 audit log
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/esp-log-puller.py
+Restart=always
+RestartSec=3
+# Environment=ESP_URL=http://192.168.0.195
+# Environment=LOG_FILE=%h/white-noise-esp.log
+
+[Install]
+WantedBy=default.target

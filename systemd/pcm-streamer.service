@@ -1,0 +1,15 @@
+[Unit]
+Description=PCM streamer for ESP32 white-noise bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/pcm-streamer.py
+Restart=always
+RestartSec=3
+# Optional: explicit audio file path (defaults to ~/white-noise/current.mp3)
+# Environment=AUDIO_FILE=/path/to/your/file.mp3
+# Environment=PORT=8081
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,36 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets — NEVER commit
+include/secrets.h
+secrets.yaml
+
+# Build outputs
+*.bin
+*.elf
+*.factory.bin
+
+# Downloaded audio (large, regenerable)
+white-noise/
+*.mp3
+*.opus
+*.webm
+*.pcm
+*.wav
+
+# Logs
+*.log
+wn-setup.log
+white-noise-esp.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
