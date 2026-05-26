@@ -69,23 +69,29 @@ def service_active() -> bool:
     return (r.stdout or "").strip() == "active"
 
 
+AUDIO_EXTS = (".mp3", ".opus", ".webm", ".m4a", ".ogg", ".flac", ".wav", ".aac")
+
+
 def list_tracks() -> list[dict]:
     if not os.path.isdir(LIBRARY_DIR):
         return []
     out = []
     for name in sorted(os.listdir(LIBRARY_DIR)):
-        if not name.lower().endswith(".mp3"):
+        if not name.lower().endswith(AUDIO_EXTS):
             continue
         path = os.path.join(LIBRARY_DIR, name)
         try:
             sz = os.path.getsize(path)
         except OSError:
             continue
-        # Friendly title: strip extension + replace underscores with spaces
-        title = re.sub(r"_[A-Za-z0-9_-]{11}\.mp3$", "", name)  # strip _<YT-id>.mp3
-        title = title.replace(".mp3", "").replace("_", " ").strip()
-        if not title:
-            title = name
+        # Friendly title: strip the trailing _<YT-id>.<ext>
+        title = re.sub(r"_[A-Za-z0-9_-]{11}\.[a-z0-9]+$", "", name, flags=re.IGNORECASE)
+        # Final cleanup: trim residual extension if no YT id matched, replace _
+        for e in AUDIO_EXTS:
+            if title.lower().endswith(e):
+                title = title[: -len(e)]
+                break
+        title = title.replace("_", " ").strip() or name
         out.append({"file": name, "title": title, "size_bytes": sz})
     return out
 
@@ -100,7 +106,7 @@ def current_track() -> str | None:
 
 def switch_track(name: str) -> bool:
     # Validate against library to prevent path traversal
-    if "/" in name or ".." in name or not name.lower().endswith(".mp3"):
+    if "/" in name or ".." in name or not name.lower().endswith(AUDIO_EXTS):
         return False
     target = os.path.join(LIBRARY_DIR, name)
     if not os.path.isfile(target):
@@ -251,36 +257,34 @@ def download_flow(url: str):
         append(f"title lookup failed: {e}")
 
     safe = sanitize_filename(title) if title else vid
-    out_name = f"{safe}_{vid}.mp3"
-    out_path = os.path.join(LIBRARY_DIR, out_name)
+    # No extension yet — yt-dlp will pick one (.opus/.m4a/.webm) based on source.
+    # We skip the slow MP3 re-encode; mpv plays anything.
+    safe_base = f"{safe}_{vid}"
+
     if title:
         append(f"title: {title}")
-    append(f"target file: {out_name}")
+    append(f"target base: {safe_base}.*")
 
-    # Dedupe by YouTube video ID — any existing file matching ..._<vid>.mp3
-    # counts as "already in library" even if its title-derived prefix differs.
+    # Dedupe by YouTube video ID — any existing file matching ..._<vid>.<ext>
     if vid != "ext" and os.path.isdir(LIBRARY_DIR):
+        pattern = f"_{vid.lower()}."
         existing = [f for f in os.listdir(LIBRARY_DIR)
-                    if f.lower().endswith(f"_{vid.lower()}.mp3")]
+                    if f.lower().endswith(AUDIO_EXTS) and pattern in f.lower()]
         if existing:
             append(f"video {vid} already in library as: {existing[0]}")
             with tasks_lock:
                 running_tasks["download"] = {"state": "done", "log": list(log), "file": existing[0]}
             return
 
-    if os.path.exists(out_path):
-        append("already in library, skipping download")
-        with tasks_lock:
-            running_tasks["download"] = {"state": "done", "log": list(log), "file": out_name}
-        return
-
-    # Step 1: download on the proxy (login shell so PATH includes ~/.local/bin)
-    remote_path = f"{PROXY_TMP}/{out_name}"
-    append("starting yt-dlp on proxy...")
+    # Step 1: download on the proxy in native format (skip mp3 transcode)
+    # yt-dlp picks the extension from the source codec.
+    remote_outtmpl = f"{PROXY_TMP}/{safe_base}.%(ext)s"
+    append("starting yt-dlp on proxy (no transcode)...")
     remote_cmd = (
-        f"mkdir -p {PROXY_TMP} && yt-dlp -f bestaudio -x --audio-format mp3 "
-        f"--audio-quality 128K -o {shlex.quote(remote_path)} --no-warnings "
-        f"--newline {shlex.quote(url)}"
+        f"mkdir -p {PROXY_TMP} && yt-dlp -f bestaudio -o {shlex.quote(remote_outtmpl)} "
+        f"--no-warnings --newline {shlex.quote(url)} "
+        # Print the final filename on stdout for us to parse:
+        f"--print after_move:filepath"
     )
     ssh_remote = f"bash -lc {shlex.quote(remote_cmd)}"
     proc = subprocess.Popen(
@@ -288,8 +292,13 @@ def download_flow(url: str):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
     assert proc.stdout is not None
+    # The last non-empty line that looks like an absolute path is the file
+    final_remote_path = ""
     for line in proc.stdout:
-        append(line.rstrip())
+        line = line.rstrip()
+        append(line)
+        if line.startswith(PROXY_TMP + "/"):
+            final_remote_path = line
     proc.wait()
     if proc.returncode != 0:
         append(f"== yt-dlp failed on proxy (exit {proc.returncode}) ==")
@@ -297,11 +306,27 @@ def download_flow(url: str):
             running_tasks["download"] = {"state": "failed", "log": list(log)}
         return
 
+    # Fallback: if --print didn't show a path, glob for it
+    if not final_remote_path:
+        ls = ssh_call(["ls", "-1"] + [f"{PROXY_TMP}/{safe_base}.{e[1:]}" for e in AUDIO_EXTS], timeout=10)
+        for line in (ls.stdout or "").splitlines():
+            if line.strip().startswith(PROXY_TMP):
+                final_remote_path = line.strip()
+                break
+    if not final_remote_path:
+        append("== couldn't determine downloaded filename ==")
+        with tasks_lock:
+            running_tasks["download"] = {"state": "failed", "log": list(log)}
+        return
+
+    out_name = os.path.basename(final_remote_path)
+    out_path = os.path.join(LIBRARY_DIR, out_name)
+
     # Step 2: scp to library
-    append("transferring file from proxy...")
+    append(f"transferring {out_name} from proxy...")
     scp = subprocess.run(
-        ["scp", "-o", "BatchMode=yes", f"{PROXY_HOST}:{remote_path}", out_path],
-        capture_output=True, text=True, timeout=120,
+        ["scp", "-o", "BatchMode=yes", f"{PROXY_HOST}:{final_remote_path}", out_path],
+        capture_output=True, text=True, timeout=180,
     )
     if scp.returncode != 0:
         append(f"scp failed: {scp.stderr.strip()[:300]}")
@@ -310,7 +335,7 @@ def download_flow(url: str):
         return
 
     # Step 3: cleanup remote
-    ssh_call(["rm", "-f", remote_path], timeout=10)
+    ssh_call(["rm", "-f", final_remote_path], timeout=10)
 
     if os.path.exists(out_path):
         append(f"== complete ({os.path.getsize(out_path)//1024//1024} MB) ==")
