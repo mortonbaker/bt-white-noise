@@ -214,10 +214,12 @@ def ssh_call(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     """Run a remote command via SSH to the download proxy.
 
     Uses bash -lc so the remote sources ~/.profile and picks up pipx's
-    ~/.local/bin on PATH (where yt-dlp lives on atlas01)."""
-    remote = " ".join(shlex.quote(x) for x in cmd)
-    full = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", PROXY_HOST,
-            "bash", "-lc", remote]
+    ~/.local/bin on PATH (where yt-dlp lives on atlas01). The whole
+    bash -lc argument is passed as a single ssh arg so ssh's word-joining
+    doesn't break the command boundaries."""
+    inner = " ".join(shlex.quote(x) for x in cmd)
+    remote = f"bash -lc {shlex.quote(inner)}"
+    full = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", PROXY_HOST, remote]
     return subprocess.run(full, capture_output=True, text=True, **kw)
 
 
@@ -255,6 +257,17 @@ def download_flow(url: str):
         append(f"title: {title}")
     append(f"target file: {out_name}")
 
+    # Dedupe by YouTube video ID — any existing file matching ..._<vid>.mp3
+    # counts as "already in library" even if its title-derived prefix differs.
+    if vid != "ext" and os.path.isdir(LIBRARY_DIR):
+        existing = [f for f in os.listdir(LIBRARY_DIR)
+                    if f.lower().endswith(f"_{vid.lower()}.mp3")]
+        if existing:
+            append(f"video {vid} already in library as: {existing[0]}")
+            with tasks_lock:
+                running_tasks["download"] = {"state": "done", "log": list(log), "file": existing[0]}
+            return
+
     if os.path.exists(out_path):
         append("already in library, skipping download")
         with tasks_lock:
@@ -269,8 +282,9 @@ def download_flow(url: str):
         f"--audio-quality 128K -o {shlex.quote(remote_path)} --no-warnings "
         f"--newline {shlex.quote(url)}"
     )
+    ssh_remote = f"bash -lc {shlex.quote(remote_cmd)}"
     proc = subprocess.Popen(
-        ["ssh", "-o", "BatchMode=yes", PROXY_HOST, "bash", "-lc", remote_cmd],
+        ["ssh", "-o", "BatchMode=yes", PROXY_HOST, ssh_remote],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
     assert proc.stdout is not None
