@@ -5,7 +5,12 @@ Bluetooth A2DP speaker (Bose SoundLink Mini and similar). Includes on-chip noise
 as a fallback. Designed for "play this rainstorm forever to a wireless speaker the moment
 it powers on" — built for baby white-noise.
 
-## What it does
+
+> **Two implementations live in this repo:**
+> - **`pi/`** — Raspberry Pi 5 + bluez + PipeWire + mpv + web portal. **This is the one that works.** See [pi/README.md](pi/README.md).
+> - **`src/` (this directory)** — original ESP32 firmware. Pairs and plays on-chip generated noise reliably, but streaming network audio to it hits hard radio-coexistence and IRAM limits. Kept for documentation of what was tried and why we moved on.
+
+## What it does (ESP32 version, original attempt)
 
 ```
    ┌─────────────────┐                ┌──────────────────┐                 ┌────────────────┐

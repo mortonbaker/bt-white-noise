@@ -1,0 +1,15 @@
+[Unit]
+Description=White noise player (mpv → default audio sink, routes to BT speaker when paired)
+After=pipewire.service wireplumber.service network.target
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mpv --no-video --loop-file=inf --no-input-terminal --no-terminal --volume=70 --audio-display=no %h/white-noise/current.mp3
+Restart=always
+RestartSec=5
+# If the audio sink disappears (Bose powers off), mpv will fail; service restarts and
+# picks up whatever the new default sink is.
+
+[Install]
+WantedBy=default.target
